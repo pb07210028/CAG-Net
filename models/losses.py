@@ -226,3 +226,220 @@ class mmIoULoss(nn.Module):
         #loss
         loss = -min_iou-torch.mean(iou)
         return loss
+
+
+#===========dice_loss+bce_loss==================
+class CrossEntropy2d(nn.Module):
+
+    def __init__(self, size_average=True, ignore_label=255):
+        super(CrossEntropy2d, self).__init__()
+        self.size_average = size_average
+        self.ignore_label = ignore_label
+
+    def forward(self, predict, target, weight=None):
+        """
+            Args:
+                predict:(n, c, h, w)
+                target:(n, h, w)
+                weight (Tensor, optional): a manual rescaling weight given to each class.
+                                           If given, has to be a Tensor of size "nclasses"
+        """
+        assert not target.requires_grad
+        assert predict.dim() == 4
+        assert target.dim() == 3#[4,321,321]
+        assert predict.size(0) == target.size(0), "{0} vs {1} ".format(predict.size(0), target.size(0))
+        assert predict.size(2) == target.size(1), "{0} vs {1} ".format(predict.size(2), target.size(1))
+        assert predict.size(3) == target.size(2), "{0} vs {1} ".format(predict.size(3), target.size(3))
+        n, c, h, w = predict.size()  # predict=[4,21,321,321]
+        # ==================================for weighted loss 直接使用此类weight效果很差======================================
+        #log_p = predict.transpose(1, 2).transpose(2, 3).contiguous().view(1, -1)  # [1,1,384,209]==>[1,80256]
+        # target_t = target.view(1, -1)
+        # target_trans = target_t.clone()
+        # pos_index = (target_t > 0)  # [1,80256]  dtype=torch.uint8 >0处为1，其他位置为0
+        # neg_index = (target_t == 0)  # [1,80256]
+        # target_trans[pos_index] = 1
+        # target_trans[neg_index] = 0
+        # pos_index = pos_index.data.cpu().numpy().astype(bool)
+        # neg_index = neg_index.data.cpu().numpy().astype(bool)  # 转换为bool后统计正负样本值
+        # weight = torch.Tensor(c).fill_(0)  # [1,80256]
+        # weight = weight.numpy()
+        # pos_num = pos_index.sum()  # 13061
+        # neg_num = neg_index.sum()  # 67195
+        # sum_num = pos_num + neg_num
+        # weight[0] = 1.0-neg_num * 1.0 / sum_num
+        # weight[1] = 1.0-pos_num * 1.0 / sum_num
+        # weight = torch.from_numpy(weight)
+        # weight = weight.cuda()
+        # ==============================================================
+        target_mask = (target >= 0) * (target != self.ignore_label)#[4,321,321] target>=0 ==>satisfy==1 or 0
+        target = target[target_mask]#[412164]
+        if not target.data.dim():
+            return Variable(torch.zeros(1))
+        predict = predict.transpose(1, 2).transpose(2, 3).contiguous()#[4,21,321,321]==>[4,321,21,321]==>[4,321,321,21] [8655444]
+        predict = predict[target_mask.view(n, h, w, 1).repeat(1, 1, 1, c)].view(-1, c)#target_mask.view(n, h, w, 1): [4,321,321]==>[4,321,321,1] ==>[4,321,321,21]==>[8655444]==>[412164,21]
+        loss = F.cross_entropy(predict, target, weight=weight, size_average=self.size_average)
+
+        return loss
+
+class dice_bce_loss(nn.Module):
+    def __init__(self, batch=True):
+        super(dice_bce_loss, self).__init__()
+        self.batch = batch
+        self.bce_loss = nn.BCELoss()
+        #self.bce_loss =CrossEntropy2d()
+        self.weight=2.0
+
+    def soft_dice_coeff(self, y_true, y_pred):
+        smooth = 1.0  # may change
+        if self.batch:
+            i = torch.sum(y_true)#对二维或多维矩阵的所有元素求和
+            j = self.weight*torch.sum(y_pred)
+            intersection = torch.sum(y_true * y_pred)
+        else:
+            i = y_true.sum(1).sum(1).sum(1)#only for batch=1
+            j = y_pred.sum(1).sum(1).sum(1)
+            intersection = (y_true * y_pred).sum(1).sum(1).sum(1)
+        score = (2. * intersection + smooth) / (i + j + smooth)
+        # score = (intersection + smooth) / (i + j - intersection + smooth)#iou
+        return score.mean()
+
+    def soft_dice_loss(self, y_true, y_pred):
+        loss = 1 - self.soft_dice_coeff(y_true, y_pred)
+        return loss
+
+    def __call__(self, y_pred, y_true):
+        a = self.bce_loss(y_pred, y_true)
+        b = self.soft_dice_loss(y_true, y_pred)
+        return a + b
+#====================for genearized dice loss========================
+from models.utils import one_hot
+from torch.autograd import Variable
+class gen_dice_loss(nn.Module):
+    def __init__(self, batch=True):
+        super(gen_dice_loss, self).__init__()
+        self.batch = batch
+        #self.bce_loss = nn.BCELoss()
+        self.bce_loss =CrossEntropy2d()
+        self.weight=2.0
+
+    def soft_dice_coeff(self, y_true, y_pred):
+        smooth = 1.0  # may change
+        # if self.batch:
+        #     i = torch.sum(y_true)#对二维或多维矩阵的所有元素求和
+        #     j = self.weight*torch.sum(y_pred)
+        #     intersection = torch.sum(y_true * y_pred)
+        # else:
+        #     i = y_true.sum(1).sum(1).sum(1)#only for batch=1
+        #     j = y_pred.sum(1).sum(1).sum(1)
+        #     intersection = (y_true * y_pred).sum(1).sum(1).sum(1)
+        # score = (2. * intersection + smooth) / (i + j + smooth)
+        #target.transpose(1, 2).transpose(2, 3).contiguous().view(1, -1)
+        if y_true.dim()!=4:
+            y_pred = F.softmax(y_pred, dim=1)
+            y_true = Variable(one_hot(y_true.data.cpu())).cuda()
+        y_true=y_true.transpose(1, 2).transpose(2, 3).contiguous().view(-1, 2)
+        y_pred = y_pred.transpose(1, 2).transpose(2, 3).contiguous().view(-1, 2)
+        # y_true = y_true.view(-1, 2)  # [1,3,4,2]==>[12,2]
+        # y_pred = y_pred.view(-1, 2)
+        sum_p = y_pred.sum(0)  # [1,2]
+        sum_r = y_true.sum(0)  # [1,2]
+        sum_pr = (y_pred * y_true).sum(0)  # [1,2]
+        weights=1.0-sum_r/sum_r.sum(0)
+        #weights = torch.pow(sum_r ** 2 + 1e-6, -1)  # seem not useful, sum_r**2==pow(sum_r,2)
+        # weights=1/(sum_r**2+1e-6)
+        gene_dice = (2 * (weights * sum_pr).sum(0).sum(0)+smooth) / ((weights * (sum_r + sum_p)).sum(0).sum(0)+smooth)
+
+        return gene_dice.mean()
+
+    def soft_dice_loss(self, y_true, y_pred):
+        loss = 1 - self.soft_dice_coeff(y_true, y_pred)
+        return loss
+
+    def __call__(self, y_pred, y_true):
+        a = self.bce_loss(y_pred, y_true)
+        b = self.soft_dice_loss(y_true, y_pred)
+        return a+0.05*b
+#====================for weighted binary cross_entropy loss================
+class weighted_ce_loss(nn.Module):
+    def __init__(self, batch=True):
+        super(weighted_ce_loss, self).__init__()
+
+
+    def my_ce_loss(self, y_pred, y_true):
+        smooth = 1.0  # may change
+
+        y_true_t = Variable(one_hot(y_true.data.cpu())).cuda()
+        #y_true=y_true.transpose(1, 2).transpose(2, 3).contiguous().view(-1, 2)
+        y_true_t = y_true_t.transpose(1, 2).transpose(2, 3).contiguous().view(-1, 2)
+
+        sum_r = y_true_t.sum(0)  # [1,2]
+
+        weights = 1.0 - sum_r / sum_r.sum(0)
+        weight1=torch.from_numpy(weights.data.cpu().numpy()).cuda(0)
+
+
+        return F.cross_entropy(y_pred,y_true,weight1)
+
+
+
+    def __call__(self, y_pred, y_true):
+
+        return self.my_ce_loss(y_pred,y_true)
+
+#=============for balanced_sigmoid_cross_entropy==============
+class Balanced_CE(nn.Module):
+    '''
+     balanced_sigmoid_cross_entropy
+     input is logits before sigmoid
+    '''
+
+    # binary cross entropy loss in 2D
+    def __init__(self):
+        super(Balanced_CE, self).__init__()
+        self.bce_loss=nn.BCEWithLogitsLoss()
+    def _get_balanced_sigmoid_cross_entropy(self, x):
+        count_neg = torch.sum(1. - x)
+        count_pos = torch.sum(x)
+        beta = count_neg / (count_neg + count_pos)
+        pos_weight = beta / (1 - beta)
+        cost = torch.nn.BCEWithLogitsLoss(size_average=True, reduce=True,
+                                          pos_weight=pos_weight)  # using pos_weight not weight
+        return cost, 1 - beta
+
+    def forward(self, input, target):
+        loss=0
+        if target.sum()>0.0:
+           crition_seg,beta_seg=self._get_balanced_sigmoid_cross_entropy(target)
+           #loss+=crition_seg(input,target)*beta_seg
+           loss += crition_seg(input, target)
+        else:
+            loss+=self.bce_loss(input,target)
+        return loss
+
+#====================weighted bce_loss====================================
+class WeightedBCEWithLogitsLoss(nn.Module):
+
+    def __init__(self, size_average=True):
+        super(WeightedBCEWithLogitsLoss, self).__init__()
+        self.size_average = size_average
+
+    def weighted(self, input, target, weight, alpha, beta):
+        if not (target.size() == input.size()):
+            raise ValueError("Target size ({}) must be the same as input size ({})".format(target.size(), input.size()))
+
+        max_val = (-input).clamp(min=0)#[4,1]  # equals to F.relu
+        loss = input - input * target + max_val + ((-max_val).exp() + (-input - max_val).exp()).log()#[4,1]
+
+        if weight is not None:
+            loss = alpha * loss + beta * loss * weight
+
+        if self.size_average:
+            return loss.mean()
+        else:
+            return loss.sum()
+
+    def forward(self, input, target, weight, alpha, beta):
+        if weight is not None:
+            return self.weighted(input, target, weight, alpha, beta)
+        else:
+            return self.weighted(input, target, None, alpha, beta)
